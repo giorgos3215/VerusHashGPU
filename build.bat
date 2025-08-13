@@ -11,7 +11,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 REM Build with Visual Studio compiler
 nvcc -ccbin "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.42.34433\bin\Hostx64\x64\cl.exe" ^
-     bitsliced_verushash_miner.cu -o miner.exe ^
+     bitsliced_verushash_miner.cu stratum_client.cpp -o miner.exe ^
      -std=c++17 -O3 --ptxas-options=-v -arch=sm_89 -lws2_32 -DCUDA_ARCH=89
 
 if %ERRORLEVEL% EQU 0 (

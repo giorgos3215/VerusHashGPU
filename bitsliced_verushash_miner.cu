@@ -23,7 +23,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <cctype>
-
+=======
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -40,9 +40,9 @@
 #define SOCKET_ERROR -1
 #define closesocket close
 #endif
-
 #include "include/verushash.h"
 #include "bitsliced_haraka.cuh"
+#include "stratum_client.h"
 
 // Missing function implementation
 void verus_header_init(verus_header_t* header) {
@@ -51,6 +51,7 @@ void verus_header_init(verus_header_t* header) {
     header->nonce_offset = 108;  // Standard Bitcoin/Verus nonce position
 }
 
+=======
 struct MinerConfig {
     std::string pool_url{"pool.verus.io"};
     int port{9998};
@@ -254,6 +255,7 @@ __global__ void __launch_bounds__(128, 4) bitsliced_mining_kernel(
 }
 
 // ============================================================================
+=======
 // Complete Stratum Client Implementation
 // ============================================================================
 
@@ -996,6 +998,7 @@ public:
 };
 
 // ============================================================================
+
 // Complete Mining Implementation
 // ============================================================================
 

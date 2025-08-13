@@ -9,7 +9,7 @@ if ! command -v nvcc &> /dev/null; then
 fi
 
 # Build with GCC
-nvcc bitsliced_verushash_miner.cu -o miner \
+nvcc bitsliced_verushash_miner.cu stratum_client.cpp -o miner \
      -std=c++17 -O3 --ptxas-options=-v -arch=sm_89 -DCUDA_ARCH=89
 
 if [ $? -eq 0 ]; then
