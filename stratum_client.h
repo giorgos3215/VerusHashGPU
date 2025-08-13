@@ -25,7 +25,8 @@
 
 class BitslicedStratumClient {
 public:
-    BitslicedStratumClient();
+    BitslicedStratumClient(const std::string& host, int port,
+                           const std::string& wallet, const std::string& worker);
     ~BitslicedStratumClient();
 
     bool connect_to_pool();
@@ -39,6 +40,11 @@ private:
     SOCKET sock;
     bool connected;
     int message_id;
+
+    std::string pool_host;
+    int pool_port;
+    std::string wallet_address;
+    std::string worker_name;
 
     std::string job_id;
     std::string prevhash;

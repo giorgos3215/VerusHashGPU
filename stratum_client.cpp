@@ -15,19 +15,18 @@
 #include <cstdlib>
 #include <cstdio>
 
-// Pool configuration
-static const char* POOL_HOST = "pool.verus.io";
-static const int POOL_PORT = 9998;
-static const char* WALLET_ADDRESS = "RB4M9dk5EDqywuWY7MVQ368wsEmGKPDuhg.RTX5070";
-
 extern std::atomic<uint32_t> g_shares_accepted;
 extern std::atomic<uint32_t> g_shares_rejected;
 
-BitslicedStratumClient::BitslicedStratumClient() : sock(INVALID_SOCKET), connected(false), message_id(1),
-                                                   extranonce2_size(4), difficulty_target(0x00000400), share_counter(0),
-                                                   need_fresh_job(false), have_target(false), have_hash_reserved(false),
-                                                   have_share_target(false), have_block_target(false), current_difficulty(1.0),
-                                                   extranonce2_counter(0), clean_jobs_flag(false) {}
+BitslicedStratumClient::BitslicedStratumClient(const std::string& host, int port,
+                                               const std::string& wallet, const std::string& worker)
+    : sock(INVALID_SOCKET), connected(false), message_id(1),
+      pool_host(host), pool_port(port),
+      wallet_address(wallet), worker_name(worker),
+      extranonce2_size(4), difficulty_target(0x00000400), share_counter(0),
+      need_fresh_job(false), have_target(false), have_hash_reserved(false),
+      have_share_target(false), have_block_target(false), current_difficulty(1.0),
+      extranonce2_counter(0), clean_jobs_flag(false) {}
 
 BitslicedStratumClient::~BitslicedStratumClient() {
     if (connected && sock != INVALID_SOCKET) {
@@ -264,7 +263,7 @@ void BitslicedStratumClient::build_verus_header_from_job(const std::string& extr
 }
 
 bool BitslicedStratumClient::connect_to_pool() {
-    std::cout << "Connecting to VerusPool..." << std::endl;
+    std::cout << "Connecting to " << pool_host << ":" << pool_port << "..." << std::endl;
 
 #ifdef _WIN32
     WSADATA wsaData;
@@ -291,9 +290,9 @@ bool BitslicedStratumClient::connect_to_pool() {
 
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(POOL_PORT);
+    server_addr.sin_port = htons(pool_port);
 
-    struct hostent* host_entry = gethostbyname(POOL_HOST);
+    struct hostent* host_entry = gethostbyname(pool_host.c_str());
     if (host_entry == nullptr) {
         std::cout << "ERROR: DNS resolution failed" << std::endl;
         closesocket(sock);
@@ -315,7 +314,7 @@ bool BitslicedStratumClient::connect_to_pool() {
     }
 
     connected = true;
-    std::cout << "CONNECTED to " << POOL_HOST << ":" << POOL_PORT << std::endl;
+    std::cout << "CONNECTED to " << pool_host << ":" << pool_port << std::endl;
 
     std::string subscribe_msg = "{\"id\": " + std::to_string(message_id++) +
                                ", \"method\": \"mining.subscribe\", \"params\": [\"BitslicedMiner/1.0\"]}";
@@ -352,8 +351,10 @@ bool BitslicedStratumClient::connect_to_pool() {
         }
     }
 
+    std::string user = wallet_address;
+    if (!worker_name.empty()) user += "." + worker_name;
     std::string auth_msg = "{\"id\": " + std::to_string(message_id++) +
-                          ", \"method\": \"mining.authorize\", \"params\": [\"" + WALLET_ADDRESS + "\", \"\"]}";
+                          ", \"method\": \"mining.authorize\", \"params\": [\"" + user + "\", \"\"]}";
 
     if (!send_message(auth_msg)) {
         std::cout << "ERROR: Failed to send authorize" << std::endl;
@@ -526,8 +527,10 @@ void BitslicedStratumClient::submit_share(uint32_t nonce) {
     uint8_t nb[4] = { (uint8_t)nonce, (uint8_t)(nonce>>8), (uint8_t)(nonce>>16), (uint8_t)(nonce>>24) };
     std::string nonce_hex = to_hex(nb, 4);
 
+    std::string user = wallet_address;
+    if (!worker_name.empty()) user += "." + worker_name;
     std::string msg = "{\"id\":" + std::to_string(message_id++) +
-        ",\"method\":\"mining.submit\",\"params\":[\"" + std::string(WALLET_ADDRESS) +
+        ",\"method\":\"mining.submit\",\"params\":[\"" + user +
         "\",\"" + job_id + "\",\"" + current_extranonce2 + "\",\"" + ntime + "\",\"" + nonce_hex + "\"]}";
 
     send_message(msg);

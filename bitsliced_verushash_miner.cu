@@ -771,6 +771,9 @@ public:
 
         connected = true;
 
+        log_status("CONNECTED to {}:{}", pool_host, pool_port);
+
+
 
         log_status("CONNECTED to %s:%d", POOL_HOST, POOL_PORT);
 
@@ -780,7 +783,7 @@ public:
         std::cout << "CONNECTED to " << pool_host << ":" << pool_port << std::endl;
 
 
-        
+
         // Subscribe
         std::string subscribe_msg = "{\"id\": " + std::to_string(message_id++) + 
                                    ", \"method\": \"mining.subscribe\", \"params\": [\"BitslicedMiner/1.0\"]}";
