@@ -4,76 +4,137 @@
 // ============================================================================
 
 #pragma once
-#include <cuda_runtime.h>
 #include <stdint.h>
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#else
+#define __device__
+#define __forceinline__ inline
+#define __constant__
+#endif
 
 // ============================================================================
 // Boyar-Peralta Bitsliced AES S-box Implementation
 // 113 XOR gates + 32 AND gates, no memory lookups  
 // ============================================================================
 
-// Temporary LUT-based S-box for correctness (will optimize later)
-__constant__ uint8_t d_aes_sbox[256] = {
-    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
-};
-
 __device__ __forceinline__ void boyar_peralta_sbox(
     uint64_t* x7, uint64_t* x6, uint64_t* x5, uint64_t* x4,
     uint64_t* x3, uint64_t* x2, uint64_t* x1, uint64_t* x0)
 {
-    // LUT-based S-box for correctness - processes 64 lanes in parallel
-    uint64_t o7 = 0, o6 = 0, o5 = 0, o4 = 0, o3 = 0, o2 = 0, o1 = 0, o0 = 0;
-    
-    #pragma unroll
-    for (int lane = 0; lane < 64; lane++) {
-        // Extract input byte from bit lane
-        uint8_t input_byte = 0;
-        if (*x0 & (1ULL << lane)) input_byte |= 0x01;
-        if (*x1 & (1ULL << lane)) input_byte |= 0x02;
-        if (*x2 & (1ULL << lane)) input_byte |= 0x04;
-        if (*x3 & (1ULL << lane)) input_byte |= 0x08;
-        if (*x4 & (1ULL << lane)) input_byte |= 0x10;
-        if (*x5 & (1ULL << lane)) input_byte |= 0x20;
-        if (*x6 & (1ULL << lane)) input_byte |= 0x40;
-        if (*x7 & (1ULL << lane)) input_byte |= 0x80;
-        
-        // Apply S-box lookup
-        uint8_t output_byte = d_aes_sbox[input_byte];
-        
-        // Distribute output back to bit planes
-        if (output_byte & 0x01) o0 |= (1ULL << lane);
-        if (output_byte & 0x02) o1 |= (1ULL << lane);
-        if (output_byte & 0x04) o2 |= (1ULL << lane);
-        if (output_byte & 0x08) o3 |= (1ULL << lane);
-        if (output_byte & 0x10) o4 |= (1ULL << lane);
-        if (output_byte & 0x20) o5 |= (1ULL << lane);
-        if (output_byte & 0x40) o6 |= (1ULL << lane);
-        if (output_byte & 0x80) o7 |= (1ULL << lane);
-    }
-    
-    *x0 = o0;
-    *x1 = o1;
-    *x2 = o2;
-    *x3 = o3;
-    *x4 = o4;
-    *x5 = o5;
-    *x6 = o6;
-    *x7 = o7;
+    // Load bitplanes
+    uint64_t U0 = *x7, U1 = *x6, U2 = *x5, U3 = *x4;
+    uint64_t U4 = *x3, U5 = *x2, U6 = *x1, U7 = *x0;
+
+    // Linear preprocessing
+    uint64_t T1 = U0 ^ U3;
+    uint64_t T2 = U0 ^ U5;
+    uint64_t T3 = U0 ^ U6;
+    uint64_t T4 = U3 ^ U5;
+    uint64_t T5 = U4 ^ U6;
+    uint64_t T6 = T1 ^ T5;
+    uint64_t T7 = U1 ^ U2;
+    uint64_t T8 = U7 ^ T6;
+    uint64_t T9 = U7 ^ T7;
+    uint64_t T10 = T6 ^ T7;
+    uint64_t T11 = U1 ^ U5;
+    uint64_t T12 = U2 ^ U5;
+    uint64_t T13 = T3 ^ T4;
+    uint64_t T14 = T6 ^ T11;
+    uint64_t T15 = T5 ^ T11;
+    uint64_t T16 = T5 ^ T12;
+    uint64_t T17 = T9 ^ T16;
+    uint64_t T18 = U3 ^ U7;
+    uint64_t T19 = T7 ^ T18;
+    uint64_t T20 = T1 ^ T19;
+    uint64_t T21 = U6 ^ U7;
+    uint64_t T22 = T7 ^ T21;
+    uint64_t T23 = T2 ^ T22;
+    uint64_t T24 = T2 ^ T10;
+    uint64_t T25 = T20 ^ T17;
+    uint64_t T26 = T3 ^ T16;
+    uint64_t T27 = T1 ^ T12;
+    uint64_t D  = U7;
+
+    // Non-linear transformation
+    uint64_t M1 = T13 & T6;
+    uint64_t M6 = T3 & T16;
+    uint64_t M11 = T1 & T15;
+    uint64_t M13 = (T4 & T27) ^ M11;
+    uint64_t M15 = (T2 & T10) ^ M11;
+    uint64_t M20 = T14 ^ M1 ^ (T23 & T8) ^ M13;
+    uint64_t M21 = (T19 & D) ^ M1 ^ T24 ^ M15;
+    uint64_t M22 = T26 ^ M6 ^ (T22 & T9) ^ M13;
+    uint64_t M23 = (T20 & T17) ^ M6 ^ M15 ^ T25;
+    uint64_t M25 = M22 & M20;
+    uint64_t M37 = M21 ^ ((M20 ^ M21) & (M23 ^ M25));
+    uint64_t M38 = M20 ^ M25 ^ (M21 | (M20 & M23));
+    uint64_t M39 = M23 ^ ((M22 ^ M23) & (M21 ^ M25));
+    uint64_t M40 = M22 ^ M25 ^ (M23 | (M21 & M22));
+    uint64_t M41 = M38 ^ M40;
+    uint64_t M42 = M37 ^ M39;
+    uint64_t M43 = M37 ^ M38;
+    uint64_t M44 = M39 ^ M40;
+    uint64_t M45 = M42 ^ M41;
+    uint64_t M46 = M44 & T6;
+    uint64_t M47 = M40 & T8;
+    uint64_t M48 = M39 & D;
+    uint64_t M49 = M43 & T16;
+    uint64_t M50 = M38 & T9;
+    uint64_t M51 = M37 & T17;
+    uint64_t M52 = M42 & T15;
+    uint64_t M53 = M45 & T27;
+    uint64_t M54 = M41 & T10;
+    uint64_t M55 = M44 & T13;
+    uint64_t M56 = M40 & T23;
+    uint64_t M57 = M39 & T19;
+    uint64_t M58 = M43 & T3;
+    uint64_t M59 = M38 & T22;
+    uint64_t M60 = M37 & T20;
+    uint64_t M61 = M42 & T1;
+    uint64_t M62 = M45 & T4;
+    uint64_t M63 = M41 & T2;
+
+    // Linear postprocessing
+    uint64_t L0 = M61 ^ M62;
+    uint64_t L1 = M50 ^ M56;
+    uint64_t L2 = M46 ^ M48;
+    uint64_t L3 = M47 ^ M55;
+    uint64_t L4 = M54 ^ M58;
+    uint64_t L5 = M49 ^ M61;
+    uint64_t L6 = M62 ^ L5;
+    uint64_t L7 = M46 ^ L3;
+    uint64_t L8 = M51 ^ M59;
+    uint64_t L9 = M52 ^ M53;
+    uint64_t L10 = M53 ^ L4;
+    uint64_t L11 = M60 ^ L2;
+    uint64_t L12 = M48 ^ M51;
+    uint64_t L13 = M50 ^ L0;
+    uint64_t L14 = M52 ^ M61;
+    uint64_t L15 = M55 ^ L1;
+    uint64_t L16 = M56 ^ L0;
+    uint64_t L17 = M57 ^ L1;
+    uint64_t L18 = M58 ^ L8;
+    uint64_t L19 = M63 ^ L4;
+    uint64_t L20 = L0 ^ L1;
+    uint64_t L21 = L1 ^ L7;
+    uint64_t L22 = L3 ^ L12;
+    uint64_t L23 = L18 ^ L2;
+    uint64_t L24 = L15 ^ L9;
+    uint64_t L25 = L6 ^ L10;
+    uint64_t L26 = L7 ^ L9;
+    uint64_t L27 = L8 ^ L10;
+    uint64_t L28 = L11 ^ L14;
+    uint64_t L29 = L11 ^ L17;
+
+    *x7 = L6 ^ L24;
+    *x6 = ~(L16 ^ L26);
+    *x5 = ~(L19 ^ L28);
+    *x4 = L6 ^ L21;
+    *x3 = L20 ^ L22;
+    *x2 = L25 ^ L29;
+    *x1 = ~(L13 ^ L27);
+    *x0 = ~(L6 ^ L23);
 }
 
 // Haraka round constants (same for all 64 parallel instances)
