@@ -11,7 +11,7 @@ fi
 
 # Build with GCC
 nvcc bitsliced_verushash_miner.cu -o miner \
-     -std=c++17 -O3 --ptxas-options=-v -arch=sm_89 -DCUDA_ARCH=89 -lfmt
+     -std=c++17 -O3 --ptxas-options=-v -arch=sm_89 -DCUDA_ARCH=89
 
 if [ $? -eq 0 ]; then
     echo "Build successful! Run ./miner to start mining."
