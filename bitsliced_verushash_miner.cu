@@ -772,11 +772,8 @@ public:
 
         connected = true;
 
-        log_status("CONNECTED to {}:{}", POOL_HOST, POOL_PORT);
-=======
-        std::cout << "CONNECTED to " << pool_host << ":" << pool_port << std::endl;
+        log_status("CONNECTED to {}:{}", pool_host, pool_port);
 
-        
         // Subscribe
         std::string subscribe_msg = "{\"id\": " + std::to_string(message_id++) + 
                                    ", \"method\": \"mining.subscribe\", \"params\": [\"BitslicedMiner/1.0\"]}";
@@ -1069,14 +1066,8 @@ public:
 // Complete Mining Implementation
 // ============================================================================
 
-void run_bitsliced_mining() {
-    BitslicedStratumClient stratum;
-
-
 void run_bitsliced_mining(const MinerConfig& cfg) {
     BitslicedStratumClient stratum(cfg.pool_url, cfg.port, cfg.wallet, cfg.worker);
-    
-main
     if (!stratum.connect_to_pool()) {
         log_error("Failed to connect to pool");
         return;
