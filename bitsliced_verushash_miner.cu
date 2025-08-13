@@ -32,6 +32,9 @@
 #include <cctype>
 
 
+#include <fstream>
+#include <cctype>
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -703,7 +706,9 @@ public:
     bool connect_to_pool() {
 
         log_status("Connecting to VerusPool...");
+
         std::cout << "Connecting to " << pool_host << ":" << pool_port << "..." << std::endl;
+
 
         
 #ifdef _WIN32
@@ -773,6 +778,7 @@ public:
         log_status("CONNECTED to {}:{}", POOL_HOST, POOL_PORT);
 
         std::cout << "CONNECTED to " << pool_host << ":" << pool_port << std::endl;
+
 
         
         // Subscribe
@@ -1072,17 +1078,27 @@ void run_bitsliced_mining(const MinerConfig& cfg) {
 
     BitslicedStratumClient stratum(cfg.pool_url, cfg.port, cfg.wallet, cfg.worker);
 
-    
-main
+
+    // Device buffers and CUDA events
+    uint8_t *d_header = nullptr, *d_found_hashes = nullptr, *d_target_le = nullptr;
+    uint32_t *d_found_nonces = nullptr, *d_found_count = nullptr;
+    cudaStream_t stream;
+    cudaEvent_t start_evt, stop_evt, copy_done_evt;
+
+    // Host-side buffers
+    verus_header_t current_header, pending_header;
+    bool have_pending = false;
+    uint32_t h_found_nonces[8];
+    uint8_t h_found_hashes[256];
+    uint32_t h_found_count = 0;
+    uint8_t target_le_host[32];
+    uint8_t pending_target_le[32];
+
 
     if (!stratum.connect_to_pool()) {
         log_error("Failed to connect to pool");
         return;
     }
-
-    // GPU memory allocation
-    uint8_t *d_header, *d_found_hashes, *d_target_le;
-    uint32_t *d_found_nonces, *d_found_count;
 
     CUDA_CHECK(cudaMalloc(&d_header, VERUS_HEADER_SIZE));
     CUDA_CHECK(cudaMalloc(&d_found_nonces, 8 * sizeof(uint32_t)));
@@ -1090,26 +1106,26 @@ main
     CUDA_CHECK(cudaMalloc(&d_found_count, sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_target_le, 32));
 
-    cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    cudaEvent_t start_evt, stop_evt, copy_done_evt;
     CUDA_CHECK(cudaEventCreate(&start_evt));
     CUDA_CHECK(cudaEventCreate(&stop_evt));
     CUDA_CHECK(cudaEventCreate(&copy_done_evt));
-
-    verus_header_t current_header, pending_header;
-    bool have_pending = false;
-    uint32_t h_found_nonces[8];
-    uint8_t h_found_hashes[256];
-    uint32_t h_found_count;
-    uint8_t target_le_host[32];
-    uint8_t pending_target_le[32];
 
     // Obtain initial work
     while (!stratum.get_work(&current_header)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     stratum.get_share_target_le(target_le_host);
+
+
+    log_status("Current difficulty: {}", stratum.get_current_difficulty());
+    log_status("Starting bitsliced mining loop...");
+
+    const uint32_t BATCH_SIZE = cfg.batch_size;
+    const int THREADS_PER_BLOCK = 128;
+    const int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
+    const size_t PER_WARP_SMEM  = BITSLICE_WIDTH * VERUS_HEADER_SIZE + BITSLICE_WIDTH * 32;
+    const size_t SHMEM          = VERUS_HEADER_SIZE + WARPS_PER_BLOCK * PER_WARP_SMEM;
 
 
     
@@ -1132,6 +1148,7 @@ main
     const size_t PER_WARP_SMEM  = BITSLICE_WIDTH * VERUS_HEADER_SIZE + BITSLICE_WIDTH * 32; // 9216 bytes
     const size_t SHMEM          = VERUS_HEADER_SIZE + WARPS_PER_BLOCK * PER_WARP_SMEM;      // 112 + 4*9216 = 36,976
 
+
     uint64_t nonce_base = 0;
 
     while (g_mining_active) {
@@ -1152,15 +1169,13 @@ main
         CUDA_CHECK(cudaMemcpyAsync(d_target_le, target_le_host, 32, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(d_header, current_header.header_data, VERUS_HEADER_SIZE, cudaMemcpyHostToDevice, stream));
         h_found_count = 0;
-      
         CUDA_CHECK(cudaMemcpyAsync(d_found_count, &h_found_count, sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
 
         cudaEventRecord(start_evt, stream);
         bitsliced_mining_kernel<<<192, THREADS_PER_BLOCK, SHMEM, stream>>>(
             d_header, current_header.nonce_offset, nonce_base,
             BATCH_SIZE, d_target_le,
-            d_found_nonces, d_found_hashes, d_found_count
-        );
+            d_found_nonces, d_found_hashes, d_found_count);
         cudaEventRecord(stop_evt, stream);
 
         CUDA_CHECK(cudaMemcpyAsync(&h_found_count, d_found_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
@@ -1183,13 +1198,15 @@ main
         double batch_seconds = kernel_ms / 1000.0;
 
         if (h_found_count > 0) {
+            log_warn("FOUND {} potential shares!", h_found_count);
+
 
             log_warn("FOUND %u potential shares!", h_found_count);
+
 
             uint32_t to_copy = std::min(h_found_count, 8u);
             CUDA_CHECK(cudaMemcpy(h_found_nonces, d_found_nonces, to_copy * sizeof(uint32_t), cudaMemcpyDeviceToHost));
             CUDA_CHECK(cudaMemcpy(h_found_hashes, d_found_hashes, to_copy * 32, cudaMemcpyDeviceToHost));
-
             for (uint32_t i = 0; i < to_copy; i++) {
                 uint32_t found_nonce = h_found_nonces[i];
                 std::string hash_hex;
@@ -1198,6 +1215,9 @@ main
                     std::snprintf(buf, sizeof(buf), "%02x", h_found_hashes[i * 32 + j]);
                     hash_hex += buf;
                 }
+
+                log_status("Share found! Nonce: {:#x} Hash: {}", found_nonce, hash_hex);
+
 
                 log_status("Share found! Nonce: %#x Hash: %s", found_nonce, hash_hex.c_str());
 
@@ -1212,9 +1232,7 @@ main
         }
 
         g_total_hashes += BATCH_SIZE;
-
         double current_hashrate = BATCH_SIZE / batch_seconds / 1000000.0;
-
         print_summary(current_hashrate);
 
         if (!have_pending) {
@@ -1249,11 +1267,19 @@ int main(int argc, char** argv) {
     cudaSetDevice(0);
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
+
+
+    log_status("Mining Device: {}", prop.name);
+    log_status("Architecture: sm_{}{}", prop.major, prop.minor);
+    fmt::print("\n");
+
+
     
     log_status("Mining Device: %s", prop.name);
     log_status("Architecture: sm_%d%d", prop.major, prop.minor);
     std::cout << std::endl;
     
+
     MinerConfig cfg = parse_config(argc, argv);
 
     if (cfg.pool_url.empty()) {
@@ -1268,18 +1294,22 @@ int main(int argc, char** argv) {
         std::cerr << "Wallet address is required" << std::endl;
         return 1;
     }
-    if (cfg.batch_size == 0 || cfg.batch_size % BITSLICE_WIDTH != 0) {
-        std::cerr << "Batch size must be a multiple of " << BITSLICE_WIDTH << std::endl;
-        return 1;
-    }
 
-    // Configuration for bitsliced mining
     const uint32_t BATCH_SIZE = cfg.batch_size;
     const int THREADS_PER_BLOCK = 256;
     const int WARPS_PER_BLOCK = THREADS_PER_BLOCK / WARP_SIZE;
     const int BLOCKS_PER_GRID = prop.multiProcessorCount * 4;
-    
+
     log_status("Bitsliced Configuration:");
+
+    log_status("- Hashes per warp: {}", BITSLICE_WIDTH);
+    log_status("- Warps per block: {}", WARPS_PER_BLOCK);
+    log_status("- Blocks: {}", BLOCKS_PER_GRID);
+    log_status("- Total parallel hashes: {}", BLOCKS_PER_GRID * WARPS_PER_BLOCK * BITSLICE_WIDTH);
+    log_status("- Batch size: {} nonces", BATCH_SIZE);
+    fmt::print("\n");
+
+
     log_status("- Hashes per warp: %d", BITSLICE_WIDTH);
     log_status("- Warps per block: %d", WARPS_PER_BLOCK);
     log_status("- Blocks: %d", BLOCKS_PER_GRID);
@@ -1288,8 +1318,9 @@ int main(int argc, char** argv) {
     std::cout << std::endl;
     
     // Start bitsliced mining
+
     log_status("Starting bitsliced VerusHash mining...");
-    
+
     try {
         run_bitsliced_mining(cfg);
     } catch (const std::exception& e) {
