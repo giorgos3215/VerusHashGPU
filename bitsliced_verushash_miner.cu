@@ -21,6 +21,8 @@
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
+#include <fstream>
+#include <cctype>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -48,10 +50,13 @@ void verus_header_init(verus_header_t* header) {
     header->nonce_offset = 108;  // Standard Bitcoin/Verus nonce position
 }
 
-// Pool configuration
-const char* POOL_HOST = "pool.verus.io";
-const int POOL_PORT = 9998;
-const char* WALLET_ADDRESS = "RB4M9dk5EDqywuWY7MVQ368wsEmGKPDuhg.RTX5070";
+struct MinerConfig {
+    std::string pool_url{"pool.verus.io"};
+    int port{9998};
+    std::string wallet;
+    std::string worker;
+    uint32_t batch_size{1048576};
+};
 
 // Bitslicing configuration
 #define BITSLICE_WIDTH 64  // Process 64 hashes in parallel
@@ -265,13 +270,76 @@ public:
         }
         return "";
     }
+    static int extract_int(const std::string& json, const std::string& key) {
+        std::string search = "\"" + key + "\":";
+        size_t pos = json.find(search);
+        if (pos != std::string::npos) {
+            size_t start = pos + search.length();
+            while (start < json.size() && std::isspace(json[start])) start++;
+            size_t end = start;
+            while (end < json.size() && (std::isdigit(json[end]) || json[end]=='-' || json[end]=='+')) end++;
+            if (end > start) {
+                return std::stoi(json.substr(start, end - start));
+            }
+        }
+        return 0;
+    }
 };
+
+MinerConfig parse_config(int argc, char** argv) {
+    MinerConfig cfg;
+    std::string config_path;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--config" && i + 1 < argc) {
+            config_path = argv[++i];
+        } else if (arg == "--pool" && i + 1 < argc) {
+            cfg.pool_url = argv[++i];
+        } else if (arg == "--port" && i + 1 < argc) {
+            cfg.port = std::stoi(argv[++i]);
+        } else if (arg == "--wallet" && i + 1 < argc) {
+            cfg.wallet = argv[++i];
+        } else if (arg == "--worker" && i + 1 < argc) {
+            cfg.worker = argv[++i];
+        } else if (arg == "--batch" && i + 1 < argc) {
+            cfg.batch_size = static_cast<uint32_t>(std::stoul(argv[++i]));
+        }
+    }
+
+    if (!config_path.empty()) {
+        std::ifstream f(config_path);
+        if (f) {
+            std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            std::string s;
+            s = SimpleJsonParser::extract_string(json, "pool");
+            if (!s.empty()) cfg.pool_url = s;
+            s = SimpleJsonParser::extract_string(json, "wallet");
+            if (!s.empty()) cfg.wallet = s;
+            s = SimpleJsonParser::extract_string(json, "worker");
+            if (!s.empty()) cfg.worker = s;
+            int port = SimpleJsonParser::extract_int(json, "port");
+            if (port > 0) cfg.port = port;
+            int batch = SimpleJsonParser::extract_int(json, "batch");
+            if (batch > 0) cfg.batch_size = static_cast<uint32_t>(batch);
+        } else {
+            std::cerr << "Could not open config file: " << config_path << std::endl;
+        }
+    }
+
+    return cfg;
+}
 
 class BitslicedStratumClient {
 private:
     SOCKET sock;
     bool connected;
     int message_id;
+
+    std::string pool_host;
+    int pool_port;
+    std::string wallet_address;
+    std::string worker_name;
     
     std::string job_id;
     std::string prevhash;
@@ -566,14 +634,17 @@ private:
     }
     
 public:
-    BitslicedStratumClient() : sock(INVALID_SOCKET), connected(false), message_id(1), 
-                               extranonce2_size(4), difficulty_target(0x00000400), share_counter(0), 
-                               need_fresh_job(false), have_target(false), have_hash_reserved(false), 
-                               have_share_target(false), have_block_target(false), current_difficulty(1.0),
-                               extranonce2_counter(0), clean_jobs_flag(false) {}
+    BitslicedStratumClient(const std::string& host, int port,
+                           const std::string& wallet, const std::string& worker)
+        : sock(INVALID_SOCKET), connected(false), message_id(1),
+          pool_host(host), pool_port(port), wallet_address(wallet), worker_name(worker),
+          extranonce2_size(4), difficulty_target(0x00000400), share_counter(0),
+          need_fresh_job(false), have_target(false), have_hash_reserved(false),
+          have_share_target(false), have_block_target(false), current_difficulty(1.0),
+          extranonce2_counter(0), clean_jobs_flag(false) {}
     
     bool connect_to_pool() {
-        std::cout << "Connecting to VerusPool..." << std::endl;
+        std::cout << "Connecting to " << pool_host << ":" << pool_port << "..." << std::endl;
         
 #ifdef _WIN32
         WSADATA wsaData;
@@ -600,10 +671,10 @@ public:
         
         struct sockaddr_in server_addr;
         server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(POOL_PORT);
+        server_addr.sin_port = htons(pool_port);
         
         // Resolve hostname
-        struct hostent* host_entry = gethostbyname(POOL_HOST);
+        struct hostent* host_entry = gethostbyname(pool_host.c_str());
         if (host_entry == nullptr) {
             std::cout << "ERROR: DNS resolution failed" << std::endl;
             closesocket(sock);
@@ -625,7 +696,7 @@ public:
         }
         
         connected = true;
-        std::cout << "CONNECTED to " << POOL_HOST << ":" << POOL_PORT << std::endl;
+        std::cout << "CONNECTED to " << pool_host << ":" << pool_port << std::endl;
         
         // Subscribe
         std::string subscribe_msg = "{\"id\": " + std::to_string(message_id++) + 
@@ -667,8 +738,10 @@ public:
         }
         
         // Authorize
-        std::string auth_msg = "{\"id\": " + std::to_string(message_id++) + 
-                              ", \"method\": \"mining.authorize\", \"params\": [\"" + WALLET_ADDRESS + "\", \"\"]}";
+        std::string user = wallet_address;
+        if (!worker_name.empty()) user += "." + worker_name;
+        std::string auth_msg = "{\"id\": " + std::to_string(message_id++) +
+                              ", \"method\": \"mining.authorize\", \"params\": [\"" + user + "\", \"\"]}";
         
         if (!send_message(auth_msg)) {
             std::cout << "ERROR: Failed to send authorize" << std::endl;
@@ -874,8 +947,10 @@ public:
         std::string nonce_hex = to_hex(nb, 4);
 
         // Stratum v1 submit format: [user, job_id, extranonce2, ntime, nonce]
+        std::string user = wallet_address;
+        if (!worker_name.empty()) user += "." + worker_name;
         std::string msg = "{\"id\":" + std::to_string(message_id++) +
-            ",\"method\":\"mining.submit\",\"params\":[\"" + std::string(WALLET_ADDRESS) +
+            ",\"method\":\"mining.submit\",\"params\":[\"" + user +
             "\",\"" + job_id + "\",\"" + current_extranonce2 + "\",\"" + ntime + "\",\"" + nonce_hex + "\"]}";
         
         send_message(msg);
@@ -914,8 +989,8 @@ public:
 // Complete Mining Implementation
 // ============================================================================
 
-void run_bitsliced_mining() {
-    BitslicedStratumClient stratum;
+void run_bitsliced_mining(const MinerConfig& cfg) {
+    BitslicedStratumClient stratum(cfg.pool_url, cfg.port, cfg.wallet, cfg.worker);
     
     if (!stratum.connect_to_pool()) {
         std::cout << "Failed to connect to pool" << std::endl;
@@ -943,11 +1018,12 @@ void run_bitsliced_mining() {
     std::cout << "Current difficulty: " << stratum.get_current_difficulty() << std::endl;
     
     CUDA_CHECK(cudaMemcpy(d_target_le, target_le_host, 32, cudaMemcpyHostToDevice));
-    
+
     uint64_t nonce_base = 0;
-    
+    const uint32_t BATCH_SIZE = cfg.batch_size;
+
     std::cout << "Starting bitsliced mining loop..." << std::endl;
-    
+
     while (g_mining_active) {
         if (!stratum.get_work(&h_header)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -964,9 +1040,6 @@ void run_bitsliced_mining() {
         
         h_found_count = 0;
         CUDA_CHECK(cudaMemcpy(d_found_count, &h_found_count, sizeof(uint32_t), cudaMemcpyHostToDevice));
-        
-        // Use smaller batch size for faster job switching
-        const uint32_t BATCH_SIZE = 1048576; // 1M nonces instead of 4M for faster turnaround
         
         // Launch bitsliced mining kernel with per-warp shared memory partitions
         const int THREADS_PER_BLOCK = 128;                // 4 warps
@@ -1023,7 +1096,7 @@ void run_bitsliced_mining() {
         }
         
         g_total_hashes += BATCH_SIZE;
-        
+
         double current_hashrate = BATCH_SIZE / batch_seconds / 1000000.0;
         std::cout << "Hashrate: " << std::fixed << std::setprecision(2) 
                   << current_hashrate << " MH/s" << std::endl;
@@ -1043,7 +1116,7 @@ void run_bitsliced_mining() {
 // Main Mining Function
 // ============================================================================
 
-int main() {
+int main(int argc, char** argv) {
     std::cout << "================================================================" << std::endl;
     std::cout << "       RTX 5070 - Bitsliced VerusHash Miner" << std::endl;
     std::cout << "          64 Parallel Hashes Per Warp" << std::endl;
@@ -1059,8 +1132,27 @@ int main() {
     std::cout << "Architecture: sm_" << prop.major << prop.minor << std::endl;
     std::cout << std::endl;
     
+    MinerConfig cfg = parse_config(argc, argv);
+
+    if (cfg.pool_url.empty()) {
+        std::cerr << "Pool URL is required" << std::endl;
+        return 1;
+    }
+    if (cfg.port <= 0 || cfg.port > 65535) {
+        std::cerr << "Invalid port" << std::endl;
+        return 1;
+    }
+    if (cfg.wallet.empty()) {
+        std::cerr << "Wallet address is required" << std::endl;
+        return 1;
+    }
+    if (cfg.batch_size == 0 || cfg.batch_size % BITSLICE_WIDTH != 0) {
+        std::cerr << "Batch size must be a multiple of " << BITSLICE_WIDTH << std::endl;
+        return 1;
+    }
+
     // Configuration for bitsliced mining
-    const uint32_t BATCH_SIZE = 4194304;  // 4M nonces (64K warps × 64 hashes)
+    const uint32_t BATCH_SIZE = cfg.batch_size;
     const int THREADS_PER_BLOCK = 256;
     const int WARPS_PER_BLOCK = THREADS_PER_BLOCK / WARP_SIZE;
     const int BLOCKS_PER_GRID = prop.multiProcessorCount * 4;
@@ -1077,7 +1169,7 @@ int main() {
     std::cout << "Starting bitsliced VerusHash mining..." << std::endl;
     
     try {
-        run_bitsliced_mining();
+        run_bitsliced_mining(cfg);
     } catch (const std::exception& e) {
         std::cout << "Mining error: " << e.what() << std::endl;
     }
