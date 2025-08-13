@@ -1058,13 +1058,18 @@ public:
     }
 };
 
+
 // ============================================================================
 
 // Complete Mining Implementation
 // ============================================================================
 
 void run_bitsliced_mining(const MinerConfig& cfg) {
+
     BitslicedStratumClient stratum(cfg.pool_url, cfg.port, cfg.wallet, cfg.worker);
+
+    
+main
 
     if (!stratum.connect_to_pool()) {
         log_error("Failed to connect to pool");
