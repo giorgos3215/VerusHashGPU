@@ -450,38 +450,53 @@ __device__ __forceinline__ void bitsliced_haraka512_256(
 // Helper function to transpose between standard and bitsliced formats
 // ============================================================================
 
-// Convert 64 parallel 64-byte blocks to bitsliced format
+// Convert 64 parallel 64-byte blocks to bitsliced format using warp ballots
 __device__ __forceinline__ void transpose_64x512_to_bitplanes(
-    const uint8_t input[64][64],  // 64 instances of 64 bytes each
-    uint64_t bitplanes[512])      // 512 bitplanes (64 bytes × 8 bits)
+    const uint8_t input[64][64],
+    uint64_t bitplanes[512])
 {
-    for (int byte_idx = 0; byte_idx < 64; byte_idx++) {
-        for (int bit_idx = 0; bit_idx < 8; bit_idx++) {
-            uint64_t plane = 0;
-            for (int instance = 0; instance < 64; instance++) {
-                if (input[instance][byte_idx] & (1 << bit_idx)) {
-                    plane |= (1ULL << instance);
-                }
+    const unsigned FULL_MASK = 0xffffffffu;
+    int tid  = threadIdx.x;          // 0..63
+    int lane = tid & 31;             // lane within warp
+    int warp = tid >> 5;             // warp id (0 or 1)
+
+    uint32_t* planes32 = reinterpret_cast<uint32_t*>(bitplanes);
+
+    for (int byte_idx = 0; byte_idx < 64; ++byte_idx) {
+        uint8_t val = input[tid][byte_idx];
+        #pragma unroll
+        for (int bit_idx = 0; bit_idx < 8; ++bit_idx) {
+            uint32_t mask = __ballot_sync(FULL_MASK, (val >> bit_idx) & 1);
+            if (lane == 0) {
+                planes32[(byte_idx * 8 + bit_idx) * 2 + warp] = mask;
             }
-            bitplanes[byte_idx * 8 + bit_idx] = plane;
         }
     }
 }
 
-// Convert bitsliced format back to 64 parallel 32-byte blocks
+// Convert bitsliced format back to 64 parallel 32-byte blocks using warp shuffles
 __device__ __forceinline__ void transpose_bitplanes_to_64x256(
-    const uint64_t bitplanes[256],  // 256 bitplanes (32 bytes × 8 bits)
-    uint8_t output[64][32])         // 64 instances of 32 bytes each
+    const uint64_t bitplanes[256],
+    uint8_t output[64][32])
 {
-    for (int byte_idx = 0; byte_idx < 32; byte_idx++) {
-        for (int instance = 0; instance < 64; instance++) {
-            uint8_t byte_val = 0;
-            for (int bit_idx = 0; bit_idx < 8; bit_idx++) {
-                if (bitplanes[byte_idx * 8 + bit_idx] & (1ULL << instance)) {
-                    byte_val |= (1 << bit_idx);
-                }
+    const unsigned FULL_MASK = 0xffffffffu;
+    int tid  = threadIdx.x;          // 0..63
+    int lane = tid & 31;             // lane within warp
+    int warp = tid >> 5;             // warp id
+
+    const uint32_t* planes32 = reinterpret_cast<const uint32_t*>(bitplanes);
+
+    for (int byte_idx = 0; byte_idx < 32; ++byte_idx) {
+        uint8_t byte_val = 0;
+        #pragma unroll
+        for (int bit_idx = 0; bit_idx < 8; ++bit_idx) {
+            uint32_t mask = 0;
+            if (lane == 0) {
+                mask = planes32[(byte_idx * 8 + bit_idx) * 2 + warp];
             }
-            output[instance][byte_idx] = byte_val;
+            mask = __shfl_sync(FULL_MASK, mask, 0);
+            byte_val |= ((mask >> lane) & 1) << bit_idx;
         }
+        output[tid][byte_idx] = byte_val;
     }
 }
