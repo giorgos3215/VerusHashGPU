@@ -32,6 +32,7 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>
+#include <fcntl.h>
 #define SOCKET int
 #define INVALID_SOCKET -1
 #define SOCKET_ERROR -1
@@ -613,7 +614,16 @@ public:
 #endif
             return false;
         }
-        
+
+        // Set socket to non-blocking mode for asynchronous polling
+#ifdef _WIN32
+        u_long mode = 1;
+        ioctlsocket(sock, FIONBIO, &mode);
+#else
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
+
         connected = true;
         std::cout << "CONNECTED to " << POOL_HOST << ":" << POOL_PORT << std::endl;
         
@@ -906,98 +916,121 @@ public:
 
 void run_bitsliced_mining() {
     BitslicedStratumClient stratum;
-    
+
     if (!stratum.connect_to_pool()) {
         std::cout << "Failed to connect to pool" << std::endl;
         return;
     }
-    
+
     // GPU memory allocation
     uint8_t *d_header, *d_found_hashes, *d_target_le;
     uint32_t *d_found_nonces, *d_found_count;
-    
+
     CUDA_CHECK(cudaMalloc(&d_header, VERUS_HEADER_SIZE));
     CUDA_CHECK(cudaMalloc(&d_found_nonces, 8 * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_found_hashes, 8 * 32));
     CUDA_CHECK(cudaMalloc(&d_found_count, sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_target_le, 32));
-    
-    verus_header_t h_header;
+
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
+    cudaEvent_t start_evt, stop_evt, copy_done_evt;
+    CUDA_CHECK(cudaEventCreate(&start_evt));
+    CUDA_CHECK(cudaEventCreate(&stop_evt));
+    CUDA_CHECK(cudaEventCreate(&copy_done_evt));
+
+    verus_header_t current_header, pending_header;
+    bool have_pending = false;
     uint32_t h_found_nonces[8];
     uint8_t h_found_hashes[256];
     uint32_t h_found_count;
     uint8_t target_le_host[32];
-    
+    uint8_t pending_target_le[32];
+
+    // Obtain initial work
+    while (!stratum.get_work(&current_header)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     stratum.get_share_target_le(target_le_host);
-    
+
     std::cout << "Current difficulty: " << stratum.get_current_difficulty() << std::endl;
-    
-    CUDA_CHECK(cudaMemcpy(d_target_le, target_le_host, 32, cudaMemcpyHostToDevice));
-    
+
     uint64_t nonce_base = 0;
-    
+
     std::cout << "Starting bitsliced mining loop..." << std::endl;
-    
+
+    // Use smaller batch size for faster job switching
+    const uint32_t BATCH_SIZE = 1048576; // 1M nonces instead of 4M for faster turnaround
+    const int THREADS_PER_BLOCK = 128;                // 4 warps (keeps smem < 48KB)
+    const int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
+    const size_t PER_WARP_SMEM  = BITSLICE_WIDTH * VERUS_HEADER_SIZE + BITSLICE_WIDTH * 32; // 9216 bytes
+    const size_t SHMEM          = VERUS_HEADER_SIZE + WARPS_PER_BLOCK * PER_WARP_SMEM;      // 112 + 4*9216 = 36,976
+
     while (g_mining_active) {
-        if (!stratum.get_work(&h_header)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
+        if (have_pending) {
+            current_header = pending_header;
+            memcpy(target_le_host, pending_target_le, 32);
+            have_pending = false;
+            nonce_base = 0;
+        } else {
+            verus_header_t tmp;
+            if (stratum.get_work(&tmp)) {
+                current_header = tmp;
+                stratum.get_share_target_le(target_le_host);
+                nonce_base = 0;
+            }
         }
-        
-        // Update target for new job
-        stratum.get_share_target_le(target_le_host);
-        CUDA_CHECK(cudaMemcpy(d_target_le, target_le_host, 32, cudaMemcpyHostToDevice));
-        
-        CUDA_CHECK(cudaMemcpy(d_header, h_header.header_data, VERUS_HEADER_SIZE, cudaMemcpyHostToDevice));
-        
-        auto start_time = std::chrono::high_resolution_clock::now();
-        
+
+        CUDA_CHECK(cudaMemcpyAsync(d_target_le, target_le_host, 32, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_header, current_header.header_data, VERUS_HEADER_SIZE, cudaMemcpyHostToDevice, stream));
         h_found_count = 0;
-        CUDA_CHECK(cudaMemcpy(d_found_count, &h_found_count, sizeof(uint32_t), cudaMemcpyHostToDevice));
-        
-        // Use smaller batch size for faster job switching
-        const uint32_t BATCH_SIZE = 1048576; // 1M nonces instead of 4M for faster turnaround
-        
-        // Launch bitsliced mining kernel with per-warp shared memory partitions
-        const int THREADS_PER_BLOCK = 128;                // 4 warps (keeps smem < 48KB)
-        const int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
-        
-        const size_t PER_WARP_SMEM  = BITSLICE_WIDTH * VERUS_HEADER_SIZE + BITSLICE_WIDTH * 32; // 9216 bytes
-        const size_t SHMEM          = VERUS_HEADER_SIZE + WARPS_PER_BLOCK * PER_WARP_SMEM;      // 112 + 4*9216 = 36,976
-        
-        bitsliced_mining_kernel<<<192, THREADS_PER_BLOCK, SHMEM>>>(
-            d_header, h_header.nonce_offset, nonce_base,
+        CUDA_CHECK(cudaMemcpyAsync(d_found_count, &h_found_count, sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+
+        cudaEventRecord(start_evt, stream);
+        bitsliced_mining_kernel<<<192, THREADS_PER_BLOCK, SHMEM, stream>>>(
+            d_header, current_header.nonce_offset, nonce_base,
             BATCH_SIZE, d_target_le,
             d_found_nonces, d_found_hashes, d_found_count
         );
-        
-        CUDA_CHECK(cudaDeviceSynchronize());
-        
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time);
-        double batch_seconds = duration.count() / 1000000.0;
-        
-        CUDA_CHECK(cudaMemcpy(&h_found_count, d_found_count, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        
-        
+        cudaEventRecord(stop_evt, stream);
+
+        CUDA_CHECK(cudaMemcpyAsync(&h_found_count, d_found_count, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+        cudaEventRecord(copy_done_evt, stream);
+
+        while (cudaEventQuery(copy_done_evt) == cudaErrorNotReady) {
+            verus_header_t tmp;
+            if (stratum.get_work(&tmp)) {
+                pending_header = tmp;
+                stratum.get_share_target_le(pending_target_le);
+                have_pending = true;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        CUDA_CHECK(cudaEventSynchronize(copy_done_evt));
+
+        float kernel_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start_evt, stop_evt));
+        double batch_seconds = kernel_ms / 1000.0;
+
         if (h_found_count > 0) {
             std::cout << "FOUND " << h_found_count << " potential shares!" << std::endl;
-            
+
             uint32_t to_copy = std::min(h_found_count, 8u);
-            CUDA_CHECK(cudaMemcpy(h_found_nonces, d_found_nonces, to_copy * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(h_found_hashes, d_found_hashes, to_copy * 32, cudaMemcpyDeviceToHost));
-            
+            CUDA_CHECK(cudaMemcpyAsync(h_found_nonces, d_found_nonces, to_copy * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_found_hashes, d_found_hashes, to_copy * 32, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
             for (uint32_t i = 0; i < to_copy; i++) {
                 uint32_t found_nonce = h_found_nonces[i];
-                
+
                 std::cout << "Share found! Nonce: " << std::hex << found_nonce << std::dec;
                 std::cout << " Hash: ";
                 for (int j = 0; j < 32; j++) {
                     printf("%02x", h_found_hashes[i * 32 + j]);
                 }
                 std::cout << std::endl;
-                
-                // Check if we still have the same job before submitting
+
                 if (!stratum.need_new_job()) {
                     std::cout << "Submitting share..." << std::endl;
                     stratum.submit_share(found_nonce);
@@ -1007,17 +1040,23 @@ void run_bitsliced_mining() {
                 }
             }
         }
-        
+
         g_total_hashes += BATCH_SIZE;
-        
+
         double current_hashrate = BATCH_SIZE / batch_seconds / 1000000.0;
-        std::cout << "Hashrate: " << std::fixed << std::setprecision(2) 
+        std::cout << "Hashrate: " << std::fixed << std::setprecision(2)
                   << current_hashrate << " MH/s" << std::endl;
-        
-        nonce_base += BATCH_SIZE;
+
+        if (!have_pending) {
+            nonce_base += BATCH_SIZE;
+        }
     }
-    
+
     // Cleanup
+    cudaEventDestroy(start_evt);
+    cudaEventDestroy(stop_evt);
+    cudaEventDestroy(copy_done_evt);
+    cudaStreamDestroy(stream);
     cudaFree(d_header);
     cudaFree(d_found_nonces);
     cudaFree(d_found_hashes);
