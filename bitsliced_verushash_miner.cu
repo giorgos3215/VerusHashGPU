@@ -92,27 +92,27 @@ std::atomic<uint32_t> g_shares_rejected{0};
 
 __device__ __forceinline__ void bitsliced_verushash_v22(
     uint8_t headers[64][VERUS_HEADER_SIZE],  // 64 different headers (only nonce differs)
-    uint8_t outputs[64][32])                  // 64 hash outputs
+    uint8_t outputs[64][32],                 // 64 hash outputs
+    uint64_t* state_planes,                  // 256 bitplanes for 32-byte state
+    uint64_t* temp_planes,                   // 512 bitplanes for 64-byte working buffer
+    uint8_t*  haraka_buf)                    // 64 instances of 64 bytes each
 {
     // VerusHash v2.2 streaming - process headers in 32-byte chunks
     // Each chunk goes through Haraka512 to get 32-byte digest
-    
-    uint64_t state_planes[256];  // 256 bitplanes for 32-byte state
-    uint64_t temp_planes[512];   // 512 bitplanes for 64-byte working buffer
-    
+
     // Initialize state to zero
     #pragma unroll
     for (int i = 0; i < 256; i++) {
         state_planes[i] = 0;
     }
-    
+
+    auto haraka_inputs = (uint8_t (*)[64])haraka_buf;
+
     // Process each 32-byte chunk of the 112-byte headers
     for (int chunk_idx = 0; chunk_idx < 4; chunk_idx++) {  // 112/32 = 3.5, so 4 chunks
         int chunk_offset = chunk_idx * 32;
-        
+
         // Prepare 64-byte input for Haraka512 (32 bytes state + 32 bytes chunk)
-        uint8_t haraka_inputs[64][64];  // 64 instances of 64 bytes each
-        
         for (int instance = 0; instance < 64; instance++) {
             // First 32 bytes: current state (converted from bitplanes)
             for (int byte_idx = 0; byte_idx < 32; byte_idx++) {
@@ -124,7 +124,7 @@ __device__ __forceinline__ void bitsliced_verushash_v22(
                 }
                 haraka_inputs[instance][byte_idx] = byte_val;
             }
-            
+
             // Second 32 bytes: chunk from header (with padding for last chunk)
             for (int j = 0; j < 32; j++) {
                 if (chunk_offset + j < VERUS_HEADER_SIZE) {
@@ -134,14 +134,14 @@ __device__ __forceinline__ void bitsliced_verushash_v22(
                 }
             }
         }
-        
+
         // Transpose to bitplanes
         transpose_64x512_to_bitplanes(haraka_inputs, temp_planes);
-        
+
         // Apply bitsliced Haraka512
         bitsliced_haraka512_256(temp_planes, state_planes);
     }
-    
+
     // Convert final state back to normal format
     transpose_bitplanes_to_64x256(state_planes, outputs);
 }
@@ -178,20 +178,30 @@ __global__ void __launch_bounds__(128, 4) bitsliced_mining_kernel(
     const int warp = tid / WARP_SIZE;
     const int lane = tid % WARP_SIZE;
     
-    // Shared memory layout: [header_template][per-warp headers][per-warp hashes]
+    // Shared memory layout:
+    // [header_template][per-warp headers][per-warp hashes][per-warp work buffers]
     extern __shared__ uint8_t smem[];
     uint8_t* shared_header = smem;
 
     const int warps_per_block = blockDim.x / WARP_SIZE;
     const int warp_in_block   = threadIdx.x / WARP_SIZE;
 
-    const size_t PER_WARP_HDR_BYTES  = BITSLICE_WIDTH * VERUS_HEADER_SIZE; // 64 * 112
-    const size_t PER_WARP_HASH_BYTES = BITSLICE_WIDTH * 32;                // 64 * 32
+    const size_t PER_WARP_HDR_BYTES   = BITSLICE_WIDTH * VERUS_HEADER_SIZE; // 64 * 112
+    const size_t PER_WARP_HASH_BYTES  = BITSLICE_WIDTH * 32;                // 64 * 32
+    const size_t STATE_PLANES_BYTES   = 256 * sizeof(uint64_t);             // 2048
+    const size_t TEMP_PLANES_BYTES    = 512 * sizeof(uint64_t);             // 4096
+    const size_t HARAKA_INPUTS_BYTES  = 64 * 64;                             // 4096
+    const size_t PER_WARP_WORK_BYTES  = STATE_PLANES_BYTES + TEMP_PLANES_BYTES + HARAKA_INPUTS_BYTES;
 
-    uint8_t* region_base  = smem + VERUS_HEADER_SIZE;
-    uint8_t* headers_flat = region_base + warp_in_block * PER_WARP_HDR_BYTES;
-    uint8_t* hashes_flat  = region_base + warps_per_block * PER_WARP_HDR_BYTES
-                                       + warp_in_block * PER_WARP_HASH_BYTES;
+    uint8_t* region_base    = smem + VERUS_HEADER_SIZE;
+    uint8_t* headers_flat   = region_base + warp_in_block * PER_WARP_HDR_BYTES;
+    uint8_t* hashes_flat    = region_base + warps_per_block * PER_WARP_HDR_BYTES
+                                           + warp_in_block * PER_WARP_HASH_BYTES;
+    uint8_t* work_base      = region_base + warps_per_block * (PER_WARP_HDR_BYTES + PER_WARP_HASH_BYTES);
+    uint8_t* work_flat      = work_base + warp_in_block * PER_WARP_WORK_BYTES;
+    uint64_t* state_planes  = reinterpret_cast<uint64_t*>(work_flat);
+    uint64_t* temp_planes   = reinterpret_cast<uint64_t*>(work_flat + STATE_PLANES_BYTES);
+    uint8_t*  haraka_inputs = work_flat + STATE_PLANES_BYTES + TEMP_PLANES_BYTES;
 
     // Load header template once per block
     if (threadIdx.x < VERUS_HEADER_SIZE) {
@@ -221,7 +231,7 @@ __global__ void __launch_bounds__(128, 4) bitsliced_mining_kernel(
             // Hash directly from shared memory
             auto Hdr  = (uint8_t (*)[VERUS_HEADER_SIZE])headers_flat;
             auto Hash = (uint8_t (*)[32])               hashes_flat;
-            bitsliced_verushash_v22(Hdr, Hash);
+            bitsliced_verushash_v22(Hdr, Hash, state_planes, temp_planes, haraka_inputs);
 
             // Compare/store results
             for (int i = 0; i < BITSLICE_WIDTH; ++i) {
@@ -959,11 +969,15 @@ void run_bitsliced_mining() {
         const uint32_t BATCH_SIZE = 1048576; // 1M nonces instead of 4M for faster turnaround
         
         // Launch bitsliced mining kernel with per-warp shared memory partitions
-        const int THREADS_PER_BLOCK = 128;                // 4 warps (keeps smem < 48KB)
+        const int THREADS_PER_BLOCK = 128;                // 4 warps
         const int WARPS_PER_BLOCK   = THREADS_PER_BLOCK / WARP_SIZE;
-        
-        const size_t PER_WARP_SMEM  = BITSLICE_WIDTH * VERUS_HEADER_SIZE + BITSLICE_WIDTH * 32; // 9216 bytes
-        const size_t SHMEM          = VERUS_HEADER_SIZE + WARPS_PER_BLOCK * PER_WARP_SMEM;      // 112 + 4*9216 = 36,976
+
+        const size_t PER_WARP_SMEM  = BITSLICE_WIDTH * VERUS_HEADER_SIZE +
+                                     BITSLICE_WIDTH * 32 +
+                                     256 * sizeof(uint64_t) +
+                                     512 * sizeof(uint64_t) +
+                                     64 * 64;                            // 19,456 bytes
+        const size_t SHMEM          = VERUS_HEADER_SIZE + WARPS_PER_BLOCK * PER_WARP_SMEM; // 112 + 4*19,456 = 77,936
         
         bitsliced_mining_kernel<<<192, THREADS_PER_BLOCK, SHMEM>>>(
             d_header, h_header.nonce_offset, nonce_base,
